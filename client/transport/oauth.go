@@ -774,6 +774,7 @@ func (h *OAuthHandler) GetAuthorizationURL(ctx context.Context, state, codeChall
 		params.Set("code_challenge_method", "S256")
 	}
 
+
 	return metadata.AuthorizationEndpoint + "?" + params.Encode(), nil
 }
 

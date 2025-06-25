@@ -3,6 +3,7 @@ package transport
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/sirupsen/logrus"
 )
 
 // OAuthConfig holds the OAuth configuration for the client
@@ -20,6 +23,8 @@ type OAuthConfig struct {
 	ClientID string
 	// ClientSecret is the OAuth client secret (for confidential clients)
 	ClientSecret string
+	// ClientType is the type of client (public, confidential)
+	ClientType string
 	// RedirectURI is the redirect URI for the OAuth flow
 	RedirectURI string
 	// Scopes is the list of OAuth scopes to request
@@ -31,6 +36,13 @@ type OAuthConfig struct {
 	AuthServerMetadataURL string
 	// PKCEEnabled enables PKCE for the OAuth flow (recommended for public clients)
 	PKCEEnabled bool
+	// FIXME: @zsw
+	// AuthorizationURL is the URL to the OAuth authorization endpoint
+	AuthorizationURL string
+	// TokenURL is the URL to the OAuth token endpoint
+	TokenURL string
+	// UserInfoURL is the URL to the OAuth user info endpoint
+	UserInfoURL string
 }
 
 // TokenStore is an interface for storing and retrieving OAuth tokens
@@ -266,6 +278,10 @@ func (h *OAuthHandler) GetExpectedState() string {
 	return h.expectedState
 }
 
+func (h *OAuthHandler) SetExpectedState(expectedState string) {
+	h.expectedState = expectedState
+}
+
 // OAuthError represents a standard OAuth 2.0 error response
 type OAuthError struct {
 	ErrorCode        string `json:"error"`
@@ -290,10 +306,18 @@ type OAuthProtectedResource struct {
 
 // getServerMetadata fetches the OAuth server metadata
 func (h *OAuthHandler) getServerMetadata(ctx context.Context) (*AuthServerMetadata, error) {
+	logrus.Info("=== MCP OAuth: Starting server metadata discovery ===")
+
 	h.metadataOnce.Do(func() {
 		// If AuthServerMetadataURL is explicitly provided, use it directly
 		if h.config.AuthServerMetadataURL != "" {
+			logrus.Infof("🔧 MCP OAuth: Using explicit AuthServerMetadataURL: %s", h.config.AuthServerMetadataURL)
 			h.fetchMetadataFromURL(ctx, h.config.AuthServerMetadataURL)
+			if h.serverMetadata != nil {
+				logrus.Infof("✅ MCP OAuth: Successfully fetched metadata from explicit URL")
+			} else {
+				logrus.Errorf("❌ MCP OAuth: Failed to fetch metadata from explicit URL")
+			}
 			return
 		}
 
@@ -301,140 +325,211 @@ func (h *OAuthHandler) getServerMetadata(ctx context.Context) (*AuthServerMetada
 		// as per RFC 9728 (https://datatracker.ietf.org/doc/html/rfc9728)
 		baseURL, err := h.extractBaseURL()
 		if err != nil {
+			logrus.Errorf("❌ MCP OAuth: Failed to extract base URL: %v", err)
 			h.metadataFetchErr = fmt.Errorf("failed to extract base URL: %w", err)
 			return
 		}
+		logrus.Infof("🌐 MCP OAuth: Extracted base URL: %s", baseURL)
 
 		// Try to fetch the OAuth Protected Resource metadata
 		protectedResourceURL := baseURL + "/.well-known/oauth-protected-resource"
+		logrus.Infof("🔍 MCP OAuth: Attempting to fetch protected resource metadata from: %s", protectedResourceURL)
+
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, protectedResourceURL, nil)
 		if err != nil {
+			logrus.Errorf("❌ MCP OAuth: Failed to create protected resource request: %v", err)
 			h.metadataFetchErr = fmt.Errorf("failed to create protected resource request: %w", err)
 			return
 		}
 
 		req.Header.Set("Accept", "application/json")
 		req.Header.Set("MCP-Protocol-Version", "2025-03-26")
+		logrus.Infof("📝 MCP OAuth: Request headers: Accept=%s, MCP-Protocol-Version=%s",
+			req.Header.Get("Accept"), req.Header.Get("MCP-Protocol-Version"))
 
 		resp, err := h.httpClient.Do(req)
 		if err != nil {
+			logrus.Errorf("❌ MCP OAuth: Failed to send protected resource request: %v", err)
 			h.metadataFetchErr = fmt.Errorf("failed to send protected resource request: %w", err)
 			return
 		}
 		defer resp.Body.Close()
 
+		body, _ := io.ReadAll(resp.Body)
+		logrus.Infof("📥 MCP OAuth: Protected resource response - Status: %d, Body: %s", resp.StatusCode, string(body))
+
 		// If we can't get the protected resource metadata, fall back to default endpoints
 		if resp.StatusCode != http.StatusOK {
+			logrus.Warnf("⚠️ MCP OAuth: Protected resource request failed with status %d, falling back to default endpoints", resp.StatusCode)
 			metadata, err := h.getDefaultEndpoints(baseURL)
 			if err != nil {
+				logrus.Errorf("❌ MCP OAuth: Failed to get default endpoints: %v", err)
 				h.metadataFetchErr = fmt.Errorf("failed to get default endpoints: %w", err)
 				return
 			}
 			h.serverMetadata = metadata
+			logrus.Infof("✅ MCP OAuth: Using default endpoints for base URL: %s", baseURL)
+			logrus.Infof("📋 MCP OAuth: Default metadata - Issuer: %s, AuthZ: %s, Token: %s",
+				metadata.Issuer, metadata.AuthorizationEndpoint, metadata.TokenEndpoint)
 			return
 		}
 
 		// Parse the protected resource metadata
 		var protectedResource OAuthProtectedResource
-		if err := json.NewDecoder(resp.Body).Decode(&protectedResource); err != nil {
+		if err := json.NewDecoder(bytes.NewReader(body)).Decode(&protectedResource); err != nil {
+			logrus.Errorf("❌ MCP OAuth: Failed to decode protected resource response: %v", err)
 			h.metadataFetchErr = fmt.Errorf("failed to decode protected resource response: %w", err)
 			return
 		}
 
+		logrus.Infof("📋 MCP OAuth: Parsed protected resource - Resource: %s, AuthServers: %v",
+			protectedResource.Resource, protectedResource.AuthorizationServers)
+
 		// If no authorization servers are specified, fall back to default endpoints
 		if len(protectedResource.AuthorizationServers) == 0 {
+			logrus.Warnf("⚠️ MCP OAuth: No authorization servers found in protected resource, falling back to default endpoints")
 			metadata, err := h.getDefaultEndpoints(baseURL)
 			if err != nil {
+				logrus.Errorf("❌ MCP OAuth: Failed to get default endpoints: %v", err)
 				h.metadataFetchErr = fmt.Errorf("failed to get default endpoints: %w", err)
 				return
 			}
 			h.serverMetadata = metadata
+			logrus.Infof("✅ MCP OAuth: Using default endpoints for base URL: %s", baseURL)
 			return
 		}
 
 		// Use the first authorization server
 		authServerURL := protectedResource.AuthorizationServers[0]
-
+		logrus.Infof("🎯 MCP OAuth: Using authorization server: %s", authServerURL)
+		// FIXME: @zsw
+		authServerURL = strings.TrimSuffix(authServerURL, "/")
 		// Try OpenID Connect discovery first
-		h.fetchMetadataFromURL(ctx, authServerURL+"/.well-known/openid-configuration")
+		oidcURL := authServerURL + "/.well-known/openid-configuration"
+		logrus.Infof("🔍 MCP OAuth: Trying OpenID Connect discovery: %s", oidcURL)
+		h.fetchMetadataFromURL(ctx, oidcURL)
 		if h.serverMetadata != nil {
+			logrus.Infof("✅ MCP OAuth: Successfully fetched metadata via OpenID Connect discovery")
 			return
 		}
 
 		// If OpenID Connect discovery fails, try OAuth Authorization Server Metadata
-		h.fetchMetadataFromURL(ctx, authServerURL+"/.well-known/oauth-authorization-server")
+		oauthURL := authServerURL + "/.well-known/oauth-authorization-server"
+		logrus.Infof("🔍 MCP OAuth: Trying OAuth Authorization Server discovery: %s", oauthURL)
+		h.fetchMetadataFromURL(ctx, oauthURL)
 		if h.serverMetadata != nil {
+			logrus.Infof("✅ MCP OAuth: Successfully fetched metadata via OAuth Authorization Server discovery")
 			return
 		}
 
 		// If both discovery methods fail, use default endpoints based on the authorization server URL
+		logrus.Warnf("⚠️ MCP OAuth: Both discovery methods failed, falling back to default endpoints for auth server")
 		metadata, err := h.getDefaultEndpoints(authServerURL)
 		if err != nil {
+			logrus.Errorf("❌ MCP OAuth: Failed to get default endpoints for auth server: %v", err)
 			h.metadataFetchErr = fmt.Errorf("failed to get default endpoints: %w", err)
 			return
 		}
 		h.serverMetadata = metadata
+		logrus.Infof("✅ MCP OAuth: Using default endpoints for auth server: %s", authServerURL)
 	})
 
 	if h.metadataFetchErr != nil {
+		logrus.Errorf("❌ MCP OAuth: Server metadata discovery failed: %v", h.metadataFetchErr)
 		return nil, h.metadataFetchErr
 	}
 
+	logrus.Infof("✅ MCP OAuth: Server metadata discovery completed successfully")
+	if h.serverMetadata != nil {
+		logrus.Infof("📋 MCP OAuth: Final metadata - Issuer: %s, AuthZ: %s, Token: %s",
+			h.serverMetadata.Issuer, h.serverMetadata.AuthorizationEndpoint, h.serverMetadata.TokenEndpoint)
+	}
 	return h.serverMetadata, nil
 }
 
 // fetchMetadataFromURL fetches and parses OAuth server metadata from a URL
 func (h *OAuthHandler) fetchMetadataFromURL(ctx context.Context, metadataURL string) {
+	logrus.Infof("🔗 MCP OAuth: Fetching metadata from URL: %s", metadataURL)
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, metadataURL, nil)
 	if err != nil {
+		logrus.Errorf("❌ MCP OAuth: Failed to create metadata request for %s: %v", metadataURL, err)
 		h.metadataFetchErr = fmt.Errorf("failed to create metadata request: %w", err)
 		return
 	}
 
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("MCP-Protocol-Version", "2025-03-26")
+	logrus.Infof("📝 MCP OAuth: Metadata request headers: Accept=%s, MCP-Protocol-Version=%s",
+		req.Header.Get("Accept"), req.Header.Get("MCP-Protocol-Version"))
 
 	resp, err := h.httpClient.Do(req)
 	if err != nil {
+		logrus.Errorf("❌ MCP OAuth: Failed to send metadata request to %s: %v", metadataURL, err)
 		h.metadataFetchErr = fmt.Errorf("failed to send metadata request: %w", err)
 		return
 	}
 	defer resp.Body.Close()
 
+	// Read response body for logging
+	body, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		logrus.Errorf("❌ MCP OAuth: Failed to read metadata response body from %s: %v", metadataURL, readErr)
+		h.metadataFetchErr = fmt.Errorf("failed to read response body: %w", readErr)
+		return
+	}
+
+	logrus.Infof("📥 MCP OAuth: Metadata response from %s - Status: %d, Body: %s",
+		metadataURL, resp.StatusCode, string(body))
+
 	if resp.StatusCode != http.StatusOK {
+		logrus.Warnf("⚠️ MCP OAuth: Metadata discovery failed for %s with status %d", metadataURL, resp.StatusCode)
 		// If metadata discovery fails, don't set any metadata
 		return
 	}
 
 	var metadata AuthServerMetadata
-	if err := json.NewDecoder(resp.Body).Decode(&metadata); err != nil {
+	if err := json.NewDecoder(bytes.NewReader(body)).Decode(&metadata); err != nil {
+		logrus.Errorf("❌ MCP OAuth: Failed to decode metadata response from %s: %v", metadataURL, err)
 		h.metadataFetchErr = fmt.Errorf("failed to decode metadata response: %w", err)
 		return
 	}
 
 	h.serverMetadata = &metadata
+	logrus.Infof("✅ MCP OAuth: Successfully parsed metadata from %s", metadataURL)
+	logrus.Infof("📋 MCP OAuth: Metadata details - Issuer: %s, AuthZ: %s, Token: %s, JWKS: %s",
+		metadata.Issuer, metadata.AuthorizationEndpoint, metadata.TokenEndpoint, metadata.JwksURI)
 }
 
 // extractBaseURL extracts the base URL from the first request
 func (h *OAuthHandler) extractBaseURL() (string, error) {
+	logrus.Info("🔍 MCP OAuth: Extracting base URL...")
+
 	// If we have a base URL from a previous request, use it
 	if h.baseURL != "" {
+		logrus.Infof("✅ MCP OAuth: Using cached base URL: %s", h.baseURL)
 		return h.baseURL, nil
 	}
 
 	// Otherwise, we need to infer it from the redirect URI
 	if h.config.RedirectURI == "" {
+		logrus.Error("❌ MCP OAuth: No base URL available and no redirect URI provided")
 		return "", fmt.Errorf("no base URL available and no redirect URI provided")
 	}
+
+	logrus.Infof("🔗 MCP OAuth: Inferring base URL from redirect URI: %s", h.config.RedirectURI)
 
 	// Parse the redirect URI to extract the authority
 	parsedURL, err := url.Parse(h.config.RedirectURI)
 	if err != nil {
+		logrus.Errorf("❌ MCP OAuth: Failed to parse redirect URI %s: %v", h.config.RedirectURI, err)
 		return "", fmt.Errorf("failed to parse redirect URI: %w", err)
 	}
 
 	// Use the scheme and host from the redirect URI
 	baseURL := fmt.Sprintf("%s://%s", parsedURL.Scheme, parsedURL.Host)
+	logrus.Infof("✅ MCP OAuth: Extracted base URL: %s (scheme=%s, host=%s)",
+		baseURL, parsedURL.Scheme, parsedURL.Host)
 	return baseURL, nil
 }
 
@@ -445,27 +540,44 @@ func (h *OAuthHandler) GetServerMetadata(ctx context.Context) (*AuthServerMetada
 
 // getDefaultEndpoints returns default OAuth endpoints based on the base URL
 func (h *OAuthHandler) getDefaultEndpoints(baseURL string) (*AuthServerMetadata, error) {
+	logrus.Infof("🛠️ MCP OAuth: Creating default endpoints for base URL: %s", baseURL)
+
 	// Parse the base URL to extract the authority
 	parsedURL, err := url.Parse(baseURL)
 	if err != nil {
+		logrus.Errorf("❌ MCP OAuth: Failed to parse base URL %s: %v", baseURL, err)
 		return nil, fmt.Errorf("failed to parse base URL: %w", err)
 	}
+
+	logrus.Infof("🔍 MCP OAuth: Parsed URL - Scheme: %s, Host: %s, Path: %s",
+		parsedURL.Scheme, parsedURL.Host, parsedURL.Path)
 
 	// Discard any path component to get the authorization base URL
 	parsedURL.Path = ""
 	authBaseURL := parsedURL.String()
 
+	logrus.Infof("🌐 MCP OAuth: Auth base URL (without path): %s", authBaseURL)
+
 	// Validate that the URL has a scheme and host
 	if parsedURL.Scheme == "" || parsedURL.Host == "" {
+		logrus.Errorf("❌ MCP OAuth: Invalid base URL - missing scheme or host in %q", baseURL)
 		return nil, fmt.Errorf("invalid base URL: missing scheme or host in %q", baseURL)
 	}
 
-	return &AuthServerMetadata{
+	metadata := &AuthServerMetadata{
 		Issuer:                authBaseURL,
 		AuthorizationEndpoint: authBaseURL + "/authorize",
 		TokenEndpoint:         authBaseURL + "/token",
 		RegistrationEndpoint:  authBaseURL + "/register",
-	}, nil
+	}
+
+	logrus.Infof("✅ MCP OAuth: Created default endpoints:")
+	logrus.Infof("  📍 Issuer: %s", metadata.Issuer)
+	logrus.Infof("  🔐 Authorization: %s", metadata.AuthorizationEndpoint)
+	logrus.Infof("  🎫 Token: %s", metadata.TokenEndpoint)
+	logrus.Infof("  📝 Registration: %s", metadata.RegistrationEndpoint)
+
+	return metadata, nil
 }
 
 // RegisterClient performs dynamic client registration
@@ -571,7 +683,16 @@ func (h *OAuthHandler) ProcessAuthorizationResponse(ctx context.Context, code, s
 	data.Set("client_id", h.config.ClientID)
 	data.Set("redirect_uri", h.config.RedirectURI)
 
-	if h.config.ClientSecret != "" {
+	// 根据 ClientType 判断是否使用 base64 编码的 Authorization header
+	var authHeader string
+	if h.config.ClientType == "confidential" {
+		// 使用 client_secret_basic 认证方法
+		// 将 client_id:client_secret 进行 base64 编码
+		credentials := h.config.ClientID + ":" + h.config.ClientSecret
+		encoded := base64.StdEncoding.EncodeToString([]byte(credentials))
+		authHeader = "Basic " + encoded
+	} else if h.config.ClientSecret != "" {
+		// 对于 public 客户端或未指定 ClientType 的情况，继续使用表单参数
 		data.Set("client_secret", h.config.ClientSecret)
 	}
 
@@ -591,6 +712,11 @@ func (h *OAuthHandler) ProcessAuthorizationResponse(ctx context.Context, code, s
 
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
+
+	// 如果需要使用 Authorization header，则设置它
+	if authHeader != "" {
+		req.Header.Set("Authorization", authHeader)
+	}
 
 	resp, err := h.httpClient.Do(req)
 	if err != nil {
@@ -628,6 +754,8 @@ func (h *OAuthHandler) GetAuthorizationURL(ctx context.Context, state, codeChall
 		return "", fmt.Errorf("failed to get server metadata: %w", err)
 	}
 
+	logrus.Infof("GetAuthorizationURL: %s", metadata.AuthorizationEndpoint)
+
 	// Store the state for later validation
 	h.expectedState = state
 
@@ -648,3 +776,4 @@ func (h *OAuthHandler) GetAuthorizationURL(ctx context.Context, state, codeChall
 
 	return metadata.AuthorizationEndpoint + "?" + params.Encode(), nil
 }
+
